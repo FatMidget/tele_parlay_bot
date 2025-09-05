@@ -16,7 +16,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ========= Runtime config (Railway: set in Variables) =========
 BOT_TOKEN = os.environ.get("BOT_TOKEN") or ""        # Telegram token from @BotFather
-ODDS_API_KEY = os.environ.get("ODDS_API_KEY") or ""  # The Odds API key (optional; model still works without)
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY") or ""  # The Odds API key (optional; model works without but odds won't)
 
 # ========= App-level constants =========
 LEAGUES = {
@@ -27,6 +27,13 @@ LEAGUES = {
     "ligue1":      ("soccer_france_ligue_one",      "F1"),
     "eredivisie":  ("soccer_netherlands_eredivisie","N1"),
     "primeira":    ("soccer_portugal_primeira_liga","P1"),
+    # International competitions (odds-only mode; no football-data CSVs)
+    "worldcup":    ("soccer_fifa_world_cup",        None),
+    "euro":        ("soccer_uefa_euro",             None),
+    "ucl":         ("soccer_uefa_champs_league",    None),
+    "uel":         ("soccer_uefa_europa_league",    None),
+    "nations":     ("soccer_uefa_nations_league",   None),
+    "friendlies":  ("soccer_international_friendly",None),
 }
 SEASONS_BACK = 3          # seasons of history to learn team stats
 REGION = "eu"             # Odds API region
@@ -244,32 +251,6 @@ class LeagueTeamView:
     lam_away: float
     first_half_share: float
 
-def team_lookup(name: str, teams: Dict[str,TeamStats]) -> TeamStats:
-    for k in teams.keys():
-        if k.lower() == name.lower():
-            return teams[k]
-    # fallback: best word overlap
-    lo = name.lower().split()
-    return max(teams.items(), key=lambda kv: len(set(lo) & set(kv[0].lower().split())))[1]
-
-def build_lambdas_from_history(home_team: str, away_team: str, teams: Dict[str,TeamStats], league: LeagueStats) -> LeagueTeamView:
-    th = team_lookup(home_team, teams)
-    ta = team_lookup(away_team, teams)
-
-    lg_team_gf = (league.avg_home_goals + league.avg_away_goals) / 2.0
-    lg_team_ga = lg_team_gf
-
-    home_attack = th.gf / max(lg_team_gf, 1e-6)
-    home_def_weak = th.ga / max(lg_team_ga, 1e-6)
-    away_attack = ta.gf / max(lg_team_gf, 1e-6)
-    away_def_weak = ta.ga / max(lg_team_ga, 1e-6)
-
-    lam_h = league.avg_home_goals * home_attack * away_def_weak
-    lam_a = league.avg_away_goals * away_attack * home_def_weak
-
-    fh_share = 0.5*(th.first_half_share + ta.first_half_share)
-    return LeagueTeamView(lam_h, lam_a, fh_share)
-
 def prob_matrix(lh: float, la: float, max_goals: int = MAX_GOALS) -> np.ndarray:
     home = [poisson.pmf(i, lh) for i in range(max_goals+1)]
     away = [poisson.pmf(j, la) for j in range(max_goals+1)]
@@ -302,17 +283,78 @@ def p_no_goal_first_half(lh: float, la: float, fh_share: float) -> float:
     lam_1h = (lh+la) * fh_share
     return math.exp(-lam_1h)
 
-def calibrate_to_market_total(lh: float, la: float, target_over: Optional[float], line: Optional[float]) -> Tuple[float,float]:
-    if target_over is None or line is None:
-        return lh, la
-    s = 1.0
-    for _ in range(25):
-        M = prob_matrix(lh*s, la*s)
-        curr = over_prob(M, line)
-        diff = target_over - curr
-        s *= (1.0 + diff*0.6)
-        s = max(0.2, min(5.0, s))
-    return lh*s, la*s
+# ----- Build lambdas from historical team strengths -----
+@dataclass
+class TeamStatsView:
+    lam_home: float
+    lam_away: float
+    first_half_share: float
+
+def team_lookup(name: str, teams: Dict[str, 'TeamStats']) -> 'TeamStats':
+    for k in teams.keys():
+        if k.lower() == name.lower():
+            return teams[k]
+    lo = name.lower().split()
+    return max(teams.items(), key=lambda kv: len(set(lo) & set(kv[0].lower().split())))[1]
+
+def build_lambdas_from_history(home_team: str, away_team: str, teams: Dict[str,'TeamStats'], league: 'LeagueStats') -> TeamStatsView:
+    th = team_lookup(home_team, teams)
+    ta = team_lookup(away_team, teams)
+
+    lg_team_gf = (league.avg_home_goals + league.avg_away_goals) / 2.0
+    lg_team_ga = lg_team_gf
+
+    home_attack = th.gf / max(lg_team_gf, 1e-6)
+    home_def_weak = th.ga / max(lg_team_ga, 1e-6)
+    away_attack = ta.gf / max(lg_team_gf, 1e-6)
+    away_def_weak = ta.ga / max(lg_team_ga, 1e-6)
+
+    lam_h = league.avg_home_goals * home_attack * away_def_weak
+    lam_a = league.avg_away_goals * away_attack * home_def_weak
+
+    fh_share = 0.5*(th.first_half_share + ta.first_half_share)
+    return TeamStatsView(lam_h, lam_a, fh_share)
+
+# ----- Fallback: build lambdas directly from market odds (no history) -----
+def fit_lambdas_from_market(p_home: float, p_draw: float, p_away: float,
+                            p_over: Optional[float], line: Optional[float],
+                            fh_share_default: float = 0.45) -> TeamStatsView:
+    """
+    Choose lambdas (lam_h, lam_a) that match:
+      - total scoring level via Over probability at given line
+      - home win probability via 1X2 market (vig removed)
+    Approach: search over home/away ratio k, scale s to match Over, pick k closest to p_home.
+    """
+    if p_home is None or p_draw is None or p_away is None:
+        # if no 1X2, assume slight home edge
+        p_home = 0.38; p_draw = 0.28; p_away = 0.34
+    if p_over is None or line is None:
+        # if no totals, assume typical line ~2.5 with Over ~0.50
+        p_over, line = 0.50, 2.5
+
+    best = None
+    # search ratio k: lam_h = k * lam_a
+    for k in np.linspace(0.4, 2.6, 45):
+        # scale s to match p_over at line
+        # start lam_a_base=1, lam_h_base=k
+        lam_a = 1.0
+        lam_h = k
+        s = 1.0
+        for _ in range(20):
+            M = prob_matrix(lam_h*s, lam_a*s)
+            curr = over_prob(M, line)
+            diff = p_over - curr
+            s *= (1.0 + diff*0.6)
+            s = max(0.2, min(5.0, s))
+        lam_h_s, lam_a_s = lam_h*s, lam_a*s
+        M = prob_matrix(lam_h_s, lam_a_s)
+        ph, pd, pa = result_probs(M)
+        err = abs(ph - p_home)  # we could include draw too, but home is most informative
+        sc = (err, abs(pd - p_draw))
+        if (best is None) or (sc < best[0]):
+            best = (sc, (lam_h_s, lam_a_s))
+    lam_h_s, lam_a_s = best[1]
+    return TeamStatsView(lam_h_s, lam_a_s, fh_share_default)
 
 # ========= Parlays =========
 def prob_of_combo(mat: np.ndarray, result=None, ou=None, btts=None) -> float:
@@ -420,20 +462,36 @@ async def predict_once(league_key: str, home: str, away: str) -> str:
         return "Unknown league. Try: " + ", ".join(LEAGUES.keys())
     sport_key, fd_code = LEAGUES[league_key]
 
-    async with aiohttp.ClientSession() as session:
-        teams, league = await load_historical(session, fd_code)
-        view = build_lambdas_from_history(home, away, teams, league)
+    # 1) Try to build lambdas from historical data (if fd_code available)
+    have_history = False
+    lam_h = lam_a = None
+    fh_share = 0.45  # default fallback
 
-        # Try to get odds (optional). If it fails/quota exhausted, proceed model-only.
+    async with aiohttp.ClientSession() as session:
+        teams = league = None
+        if fd_code:  # domestic leagues
+            try:
+                teams, league = await load_historical(session, fd_code)
+                view = build_lambdas_from_history(home, away, teams, league)
+                lam_h, lam_a, fh_share = view.lam_home, view.lam_away, view.first_half_share
+                have_history = True
+            except Exception as e:
+                log.info(f"History unavailable for {league_key}: {e}")
+
+        # 2) Pull market odds (optional but preferred)
         market = None
+        market_err = None
         try:
             market = await fetch_market(session, sport_key, home, away, region=REGION)
         except Exception as e:
+            market_err = str(e)
             log.info(f"Odds fetch skipped: {e}")
 
-    # Calibrate to market total if available
-    target_over=None; line_sel=None
+    # 3) If we have market totals and/or 1X2, calibrate or fit lambdas to market
+    target_over = None; line_sel = None
+    pH=pD=pA=None
     if market:
+        # pick consensus totals near 2.5
         p_over_list=[]; lines=[]
         for b in market["books"].values():
             for ln, kv in b.get("totals", {}).items():
@@ -450,22 +508,50 @@ async def predict_once(league_key: str, home: str, away: str) -> str:
         if p_over_list:
             target_over=float(np.mean(p_over_list))
 
-    lh, la = view.lam_home, view.lam_away
-    lh, la = calibrate_to_market_total(lh, la, target_over, line_sel)
+        # 1X2 consensus
+        h2h_probs=[]
+        for b in market["books"].values():
+            h2h=b.get("h2h")
+            if h2h and all(h2h.get(k) for k in ("home","draw","away")):
+                ph, pd, pa = implied_prob(h2h["home"]), implied_prob(h2h["draw"]), implied_prob(h2h["away"])
+                ph,pd,pa = remove_vig_three(ph,pd,pa)
+                h2h_probs.append((ph,pd,pa))
+        if h2h_probs:
+            arr=np.array(h2h_probs)
+            pH,pD,pA = arr.mean(axis=0)
 
-    M = prob_matrix(lh, la, MAX_GOALS)
+        # Calibrate if we already have history; else fit from market
+        if have_history:
+            lam_h, lam_a = calibrate_to_market_total(lam_h, lam_a, target_over, line_sel)
+        else:
+            # Fit directly to market (works for internationals / CSV outages)
+            fitted = fit_lambdas_from_market(pH, pD, pA, target_over, line_sel, fh_share_default=0.45)
+            lam_h, lam_a, fh_share = fitted.lam_home, fitted.lam_away, fitted.first_half_share
+
+    # 4) If we still don't have lambdas (no history + no odds), use safe priors
+    if lam_h is None or lam_a is None:
+        lam_h, lam_a, fh_share = 1.45, 1.20, 0.45  # typical top-league priors
+
+    # 5) Build probabilities
+    M = prob_matrix(lam_h, lam_a, MAX_GOALS)
     p_home, p_draw, p_away = result_probs(M)
     p_over25 = over_prob(M, 2.5)
     p_btts = btts_prob(M)
-    p_ng1h = p_no_goal_first_half(lh, la, view.first_half_share)
+    p_ng1h = p_no_goal_first_half(lam_h, lam_a, fh_share)
 
     parts=[]
     parts.append(f"Match: {home} vs {away}")
-    parts.append("— Model (Poisson calibrated; team-specific 1H share) —")
+
+    if pH is not None:
+        parts.append(f"Market 1X2 (vig-removed): H {pct(pH)} / D {pct(pD)} / A {pct(pA)}")
+    if target_over is not None and line_sel is not None:
+        parts.append(f"Market O/U {line_sel}: Over {pct(target_over)} / Under {pct(1-target_over)}")
+
+    parts.append("— Model (Poisson; calibrated/fitted to market when possible) —")
     parts.append(f"Home {pct(p_home)}, Draw {pct(p_draw)}, Away {pct(p_away)}")
     parts.append(f"Over 2.5 {pct(p_over25)}, BTTS Yes {pct(p_btts)}, No goal 1H {pct(p_ng1h)}")
 
-    # Build parlays from a single bookmaker if odds available
+    # 6) Parlays from a single bookmaker if odds available
     if market and market["books"]:
         best=None; cover=-1
         for name,b in market["books"].items():
@@ -485,16 +571,54 @@ async def predict_once(league_key: str, home: str, away: str) -> str:
         else:
             parts.append("No suitable parlay markets available right now.")
     else:
-        parts.append("No live odds available (quota/coverage). Showing model only.")
-        # Provide 3 model-only suggestions with fair odds
-        candidates = [
-            ("HOME + Over 2.5", prob_of_combo(M, result="home", ou=("over",2.5))),
-            ("HOME + BTTS Yes", prob_of_combo(M, result="home", btts=True)),
-            ("AWAY + Over 2.5 + BTTS Yes", prob_of_combo(M, result="away", ou=("over",2.5), btts=True)),
+        # Explain why odds may be missing, then provide model-only parlays
+        if market_err:
+            parts.append(f"No live odds available ({market_err}). Showing model only.")
+        else:
+            parts.append("No live odds available (quota/coverage). Showing model only.")
+        # Select three model-only parlays (not random; computed from grid)
+        candidates = []
+        # build all 2-leg and 3-leg combos from 1X2 / O25 / U25 / BTTS Yes/No
+        basic_legs = [
+            ("result","home"), ("result","draw"), ("result","away"),
+            ("ou","over",2.5), ("ou","under",2.5),
+            ("btts",True), ("btts",False)
         ]
-        candidates.sort(key=lambda x: x[1], reverse=True)
+        from itertools import combinations
+        def model_prob_of(legs):
+            res=None; ou=None; bt=None
+            for lg in legs:
+                if lg[0]=="result": res=lg[1]
+                elif lg[0]=="ou": ou=(lg[1], lg[2])
+                elif lg[0]=="btts": bt=lg[1]
+            return prob_of_combo(M, result=res, ou=ou, btts=bt)
+        for r in (2,3):
+            for pick in combinations(basic_legs, r):
+                tags=[p[0] for p in pick]
+                if tags.count("result")>1: continue
+                if ("ou","over",2.5) in pick and ("ou","under",2.5) in pick: continue
+                if ("btts",True) in pick and ("btts",False) in pick: continue
+                p = model_prob_of(pick)
+                if p>0:
+                    name=[]
+                    for lg in pick:
+                        if lg[0]=="result": name.append(lg[1].upper())
+                        elif lg[0]=="ou": name.append(("Over" if lg[1]=="over" else "Under")+f" {lg[2]}")
+                        elif lg[0]=="btts": name.append("BTTS Yes" if lg[1] else "BTTS No")
+                    candidates.append((" + ".join(name), p))
+        # pick tiers similar to odds mode
+        # Tier1: highest probability among 2-leg
+        two=[c for c in candidates if c[0].count('+')==1]
+        tier1 = max(two, key=lambda x: x[1]) if two else max(candidates, key=lambda x: x[1])
+        # Tier2: mid prob/value band
+        mids=[c for c in candidates if 0.25<=c[1]<=0.45]
+        tier2 = max(mids, key=lambda x: x[1]) if mids else sorted(candidates, key=lambda x: -x[1])[1]
+        # Tier3: 3-leg with prob 0.05–0.20 (or highest remaining)
+        three=[c for c in candidates if c[0].count('+')==2 and 0.05<=c[1]<=0.20]
+        tier3 = max(three, key=lambda x: x[1]) if three else sorted([c for c in candidates if c[0].count('+')==2] or candidates, key=lambda x: -x[1])[0]
+
         parts.append("— Model-only parlays (fair odds) —")
-        for name, p in candidates[:3]:
+        for name, p in [tier1,tier2,tier3]:
             parts.append(f"{name} | p={p:.3f} (fair {fair_odds(p)})")
 
     return "\n".join(parts)
