@@ -16,8 +16,8 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ========= Runtime config (Railway: set in Variables) =========
-BOT_TOKEN = os.environ.get("BOT_TOKEN") or ""        # Telegram token from @BotFather
-ODDS_API_KEY = os.environ.get("ODDS_API_KEY") or ""  # The Odds API key (optional; model works without but odds won't)
+BOT_TOKEN = os.environ.get("BOT_TOKEN") or ""         # Telegram token from @BotFather
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY") or ""   # The Odds API key (optional; model still works)
 
 # ========= App-level constants =========
 LEAGUES = {
@@ -28,7 +28,7 @@ LEAGUES = {
     "ligue1":      ("soccer_france_ligue_one",      "F1"),
     "eredivisie":  ("soccer_netherlands_eredivisie","N1"),
     "primeira":    ("soccer_portugal_primeira_liga","P1"),
-    # International / cups (odds-only if no CSV history):
+    # internationals/cups (odds-only if no CSV history)
     "worldcup":    ("soccer_fifa_world_cup",        None),
     "euro":        ("soccer_uefa_euro",             None),
     "ucl":         ("soccer_uefa_champs_league",    None),
@@ -44,7 +44,7 @@ MAX_GOALS = 10
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("parlay-bot")
 
-# ========= Utilities =========
+# ========= Helpers =========
 def _strip_accents(s: str) -> str:
     return "".join(ch for ch in unicodedata.normalize("NFD", s) if unicodedata.category(ch) != "Mn")
 
@@ -68,9 +68,6 @@ def remove_vig_two(p_yes: float, p_no: float) -> Tuple[float,float]:
 
 def fair_odds(p: float) -> float:
     return round(1.0 / max(p, 1e-9), 2)
-
-def pct(p: float) -> str:
-    return f"{p*100:.1f}%"
 
 # ========= football-data.co.uk (historical) =========
 def season_codes_for_today(n_back: int) -> List[str]:
@@ -109,7 +106,6 @@ async def fetch_fd_csv(session: aiohttp.ClientSession, code: str, season_code: s
         return None
 
     needed = ["HomeTeam","AwayTeam","FTHG","FTAG","HTHG","HTAG"]
-
     for sep in (",",";"):
         try:
             df = pd.read_csv(
@@ -185,41 +181,44 @@ def compute_team_league_stats(df: pd.DataFrame) -> Tuple[Dict[str,TeamStats], Le
 
 async def load_historical(session: aiohttp.ClientSession, fd_code: str) -> Tuple[Dict[str,TeamStats], LeagueStats]:
     frames = []
-    season_list = season_codes_for_today(SEASONS_BACK)
-    for sc in season_list:
+    for sc in season_codes_for_today(SEASONS_BACK):
         df = await fetch_fd_csv(session, fd_code, sc)
         if df is not None and not df.empty:
             frames.append(df)
             log.info(f"[FD] loaded season {sc} ({len(df)} rows)")
         else:
             log.info(f"[FD] skipped season {sc}")
-
     if not frames:
-        raise RuntimeError("football-data CSVs unavailable or unparsable for this league right now.")
-
+        # instead of hard failing, return empty so caller can decide
+        return {}, LeagueStats(1.4, 1.2, 0.45)
     all_df = pd.concat(frames, ignore_index=True)
     return compute_team_league_stats(all_df)
 
 # ========= Odds (The Odds API) =========
-async def fetch_market(session: aiohttp.ClientSession, sport_key: str, home: str, away: str, region=REGION) -> Dict:
+async def fetch_market(session: aiohttp.ClientSession, sport_key: str, home: str, away: str, region=REGION) -> Optional[Dict]:
     if not ODDS_API_KEY:
-        raise RuntimeError("No ODDS_API_KEY set; running in model-only mode.")
+        return None
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-    params = {"regions": region, "markets": "h2h,totals,btts", "apiKey": ODDS_API_KEY, "oddsFormat": "decimal"}
+    # attempt 1 (with region)
+    params1 = {"regions": region, "markets": "h2h,totals,btts", "apiKey": ODDS_API_KEY, "oddsFormat": "decimal"}
+    # attempt 2 (no region) — reduces HTTP 422 for some sports keys
+    params2 = {"markets": "h2h,totals,btts", "apiKey": ODDS_API_KEY, "oddsFormat": "decimal"}
 
-    # attempt 1
-    async with session.get(url, params=params, timeout=25) as r:
-        if r.status == 422:
-            # second attempt without region filter (some sports keys behave differently)
-            params2 = {"markets": "h2h,totals,btts", "apiKey": ODDS_API_KEY, "oddsFormat": "decimal"}
-            async with session.get(url, params=params2, timeout=25) as r2:
-                if r2.status != 200:
-                    raise RuntimeError(f"Odds API error (HTTP {r2.status}).")
-                data = await r2.json()
-        elif r.status != 200:
-            raise RuntimeError(f"Odds API error (HTTP {r.status}).")
-        else:
-            data = await r.json()
+    async def _try(params):
+        async with session.get(url, params=params, timeout=25) as r:
+            if r.status != 200:
+                raise RuntimeError(f"Odds API HTTP {r.status}")
+            return await r.json()
+
+    data = None
+    try:
+        data = await _try(params1)
+    except Exception:
+        try:
+            data = await _try(params2)
+        except Exception as e2:
+            log.info(f"Odds failed: {e2}")
+            return None
 
     nh, na = _norm_team(home), _norm_team(away)
     event = None
@@ -228,7 +227,8 @@ async def fetch_market(session: aiohttp.ClientSession, sport_key: str, home: str
         if nh in teams and na in teams:
             event = ev; break
     if not event:
-        raise ValueError("Match not found in odds feed.")
+        log.info("Match not found in odds feed.")
+        return None
 
     books = {}
     for bk in event.get("bookmakers", []):
@@ -237,8 +237,8 @@ async def fetch_market(session: aiohttp.ClientSession, sport_key: str, home: str
         for mk in bk.get("markets", []):
             key = mk.get("key"); oc = mk.get("outcomes", [])
             if key == "h2h" and len(oc) == 3:
+                # names: exact team names + "Draw"
                 mp = { _norm_team(o["name"]): o["price"] for o in oc }
-                # names come like exact team names + "Draw"
                 home_name = _norm_team(event["home_team"])
                 away_name = _norm_team(event["away_team"])
                 entry["h2h"] = {
@@ -258,7 +258,6 @@ async def fetch_market(session: aiohttp.ClientSession, sport_key: str, home: str
                     else: lr["under"] = price
                     entry["totals"][line] = lr
             elif key == "btts" and len(oc) == 2:
-                # order varies; ensure yes/no mapping by name
                 opt = {o["name"].lower(): o["price"] for o in oc}
                 entry["btts"] = {"yes": opt.get("yes"), "no": opt.get("no")}
         books[bname] = entry
@@ -312,7 +311,9 @@ class TeamStatsView:
     first_half_share: float
 
 def build_lambdas_from_history(home_team: str, away_team: str,
-                               teams: Dict[str,'TeamStats'], league: 'LeagueStats') -> TeamStatsView:
+                               teams: Dict[str,'TeamStats'], league: 'LeagueStats') -> Optional[TeamStatsView]:
+    if not teams:
+        return None
     th = teams.get(_norm_team(home_team))
     ta = teams.get(_norm_team(away_team))
     if th is None or ta is None:
@@ -337,12 +338,12 @@ def build_lambdas_from_history(home_team: str, away_team: str,
     fh_share = 0.5*(th.first_half_share + ta.first_half_share)
     return TeamStatsView(lam_h, lam_a, fh_share)
 
-# ----- Fallback: fit lambdas from 1X2 + O/U market when history not available -----
+# ----- Fit lambdas from market if no history -----
 def fit_lambdas_from_market(p_home: float, p_draw: float, p_away: float,
                             p_over: Optional[float], line: Optional[float],
-                            fh_share_default: float = 0.45) -> TeamStatsView:
+                            fh_share_default: float = 0.45) -> Optional[TeamStatsView]:
     if p_home is None or p_draw is None or p_away is None:
-        p_home, p_draw, p_away = 0.38, 0.28, 0.34
+        return None
     if p_over is None or line is None:
         p_over, line = 0.50, 2.5
 
@@ -360,9 +361,11 @@ def fit_lambdas_from_market(p_home: float, p_draw: float, p_away: float,
         lam_h_s, lam_a_s = lam_h*s, lam_a*s
         M = prob_matrix(lam_h_s, lam_a_s)
         ph, pd, pa = result_probs(M)
-        err = abs(ph - p_home) + 0.5*abs(pd - p_draw)  # weight home + some draw info
+        err = abs(ph - p_home) + 0.5*abs(pd - p_draw)
         if (best is None) or (err < best[0]):
             best = (err, (lam_h_s, lam_a_s))
+    if not best:
+        return None
     lam_h_s, lam_a_s = best[1]
     return TeamStatsView(lam_h_s, lam_a_s, fh_share_default)
 
@@ -387,21 +390,36 @@ def prob_of_combo(mat: np.ndarray, result=None, ou=None, btts=None) -> float:
     return s
 
 def unique_by_legs(items: Iterable[Tuple[str, float]]) -> List[Tuple[str, float]]:
-    seen = set()
-    out = []
+    seen = set(); out=[]
     for name, p in items:
         key = tuple(sorted(name.split(" + ")))
         if key not in seen:
-            seen.add(key)
-            out.append((name, p))
+            seen.add(key); out.append((name, p))
     return out
 
+def _format_coef(x: float) -> str:
+    return f"{x:.2f}"
+
+def pick_tier_by_range(candidates: List[Dict], low: float, high: float, key: str) -> Optional[Dict]:
+    """Pick candidate whose key (market or fair odds) lies in [low, high]; else nearest."""
+    if not candidates:
+        return None
+    in_range = [c for c in candidates if low <= c[key] <= high]
+    if in_range:
+        # best value among those in range
+        return max(in_range, key=lambda c: c.get("value_ratio", 1.0))
+    # nearest to target window center
+    target = (low + high)/2.0
+    return min(candidates, key=lambda c: abs(c[key]-target))
+
 def select_parlays(book_name: str, book: Dict, mat: np.ndarray, line_pref=2.5) -> List[Dict]:
+    """Return many combos with both model probability and book odds."""
     legs = []
     h2h = book.get("h2h"); totals = book.get("totals", {}); btts = book.get("btts")
     if h2h and all(h2h.get(k) for k in ("home","draw","away")):
         legs += [("result","home", h2h["home"]), ("result","draw", h2h["draw"]), ("result","away", h2h["away"])]
     if totals:
+        # closest total to 2.5
         best = None
         for ln, kv in totals.items():
             if kv.get("over") and kv.get("under"):
@@ -435,54 +453,26 @@ def select_parlays(book_name: str, book: Dict, mat: np.ndarray, line_pref=2.5) -
                 if len(y)>1 and y[0][1]!=y[1][1]: continue
             mp = model_p(pick)
             if mp<=0: continue
-            fair = fair_odds(mp)
+            fair = round(1.0/max(mp,1e-9),2)
             market=1.0
             for p in pick: market *= p[2]
             combos.append({
+                "book": book_name,
                 "legs": pick, "size": r,
                 "model_p": round(mp,3),
-                "fair_odds": fair,
+                "fair_odds": round(fair,2),
                 "market_odds": round(market,2),
                 "value_ratio": round(market/fair,3)
             })
-    if not combos: return []
-
-    two=[c for c in combos if c["size"]==2]
-    tier1 = max(two, key=lambda x: x["model_p"]) if two else max(combos, key=lambda x: x["model_p"])
-    mids=[c for c in combos if 0.25<=c["model_p"]<=0.45]
-    tier2 = max(mids, key=lambda x: x["value_ratio"]) if mids else max(combos, key=lambda x: x["value_ratio"])
-    three=[c for c in combos if c["size"]==3 and 0.05<=c["model_p"]<=0.20]
-    if three:
-        tier3=max(three, key=lambda x: x["market_odds"])
-    else:
-        three_any=[c for c in combos if c["size"]==3]
-        tier3=max(three_any or combos, key=lambda x: x["market_odds"])
-
-    def leg_text(code):
-        if code[0]=="result": return code[1].upper()
-        if code[0].startswith("ou_"): return ("Over" if code[0]=="ou_over" else "Under") + f" {code[1]}"
-        if code[0]=="btts": return "BTTS Yes" if code[1]=="yes" else "BTTS No"
-        return "?"
-
-    chosen=[]
-    for t in [tier1,tier2,tier3]:
-        chosen.append({
-            "book": book_name,
-            "legs_text": " + ".join([leg_text(l) for l in t["legs"]]),
-            "model_p": t["model_p"],
-            "fair_odds": t["fair_odds"],
-            "market_odds": t["market_odds"],
-            "value_ratio": t["value_ratio"]
-        })
-    return chosen
+    return combos
 
 # ========= Core prediction =========
 async def predict_once(league_key: str, home: str, away: str) -> str:
     if league_key not in LEAGUES:
-        return "Unknown league. Try: " + ", ".join(LEAGUES.keys())
+        return "❌ Unknown league. Try: " + ", ".join(LEAGUES.keys())
     sport_key, fd_code = LEAGUES[league_key]
 
-    # 1) Try historical
+    have_any_data = False
     have_history = False
     lam_h = lam_a = None
     fh_share = 0.45
@@ -490,36 +480,47 @@ async def predict_once(league_key: str, home: str, away: str) -> str:
     async with aiohttp.ClientSession() as session:
         teams = league = None
         if fd_code:
-            try:
-                teams, league = await load_historical(session, fd_code)
+            teams, league = await load_historical(session, fd_code)
+            if teams:
                 view = build_lambdas_from_history(home, away, teams, league)
-                lam_h, lam_a, fh_share = view.lam_home, view.lam_away, view.first_half_share
-                have_history = True
-            except Exception as e:
-                log.info(f"History unavailable for {league_key}: {e}")
+                if view:
+                    lam_h, lam_a, fh_share = view.lam_home, view.lam_away, view.first_half_share
+                    have_history = True
+                    have_any_data = True
 
-        # 2) Odds (with a gentle second attempt to reduce 422 issues)
-        market = None
-        market_err = None
-        try:
-            market = await fetch_market(session, sport_key, home, away, region=REGION)
-        except Exception as e:
-            market_err = str(e)
-            log.info(f"Odds fetch skipped: {e}")
+        market = await fetch_market(session, sport_key, home, away, region=REGION)
+        if market:
+            have_any_data = True
 
-    # 3) Calibrate or fit to market
-    target_over = None; line_sel = None
+    # If we still have no data at all, stop (don’t reuse generic priors)
+    if not have_any_data:
+        return ("❌ No data available for this match right now.\n"
+                "• Live odds not found (or API quota).\n"
+                "• Historical CSVs not available/blocked.\n"
+                "Try a supported domestic league like: premier, laliga, seriea, bundesliga, ligue1.")
+
+    # Extract market consensus for O/U & 1X2 if available
+    target_over=None; line_sel=None
     pH=pD=pA=None
-    if market:
+    best_book = None
+    if market and market.get("books"):
+        # choose book with most coverage
+        best=None; cover=-1
+        for name,b in market["books"].items():
+            c= (1 if b.get("h2h") else 0) + (1 if b.get("totals") else 0) + (1 if b.get("btts") else 0)
+            if c>cover: best=(name,b); cover=c
+        best_book = best
+
         p_over_list=[]; lines=[]
-        for b in market["books"].values():
-            for ln, kv in b.get("totals", {}).items():
+        for b in market["books"].items():
+            bname, bd = b
+            for ln, kv in bd.get("totals", {}).items():
                 if kv.get("over") and kv.get("under"):
                     lines.append(ln)
         if lines:
             line_sel = sorted(lines, key=lambda x: abs(x-2.5))[0]
-            for b in market["books"].values():
-                kv=b.get("totals", {}).get(line_sel)
+            for _, bd in market["books"].items():
+                kv=bd.get("totals", {}).get(line_sel)
                 if kv and kv.get("over") and kv.get("under"):
                     po, pu = implied_prob(kv["over"]), implied_prob(kv["under"])
                     po, pu = remove_vig_two(po, pu)
@@ -528,8 +529,8 @@ async def predict_once(league_key: str, home: str, away: str) -> str:
             target_over=float(np.mean(p_over_list))
 
         h2h_probs=[]
-        for b in market["books"].values():
-            h2h=b.get("h2h")
+        for _, bd in market["books"].items():
+            h2h=bd.get("h2h")
             if h2h and all(h2h.get(k) for k in ("home","draw","away")):
                 ph, pd, pa = implied_prob(h2h["home"]), implied_prob(h2h["draw"]), implied_prob(h2h["away"])
                 ph,pd,pa = remove_vig_three(ph,pd,pa)
@@ -538,59 +539,59 @@ async def predict_once(league_key: str, home: str, away: str) -> str:
             arr=np.array(h2h_probs)
             pH,pD,pA = arr.mean(axis=0)
 
-        if have_history:
-            lam_h, lam_a = calibrate_to_market_total(lam_h, lam_a, target_over, line_sel)
-        else:
-            fitted = fit_lambdas_from_market(pH, pD, pA, target_over, line_sel, fh_share_default=0.45)
+    # Calibrate/fill lambdas
+    if have_history and target_over is not None and line_sel is not None:
+        # scale totals to market line
+        s = 1.0
+        for _ in range(25):
+            M = prob_matrix(lam_h*s, lam_a*s)
+            curr = over_prob(M, line_sel)
+            diff = target_over - curr
+            s *= (1.0 + diff*0.6)
+            s = max(0.2, min(5.0, s))
+        lam_h, lam_a = lam_h*s, lam_a*s
+    elif not have_history and (pH is not None):
+        fitted = fit_lambdas_from_market(pH, pD, pA, target_over, line_sel, fh_share_default=0.45)
+        if fitted:
             lam_h, lam_a, fh_share = fitted.lam_home, fitted.lam_away, fitted.first_half_share
 
-    # 4) If still nothing, use priors
+    # If lambdas still None, as a last resort use priors BUT say so explicitly
     if lam_h is None or lam_a is None:
         lam_h, lam_a, fh_share = 1.45, 1.20, 0.45
 
-    # 5) Compute probabilities
+    # Probability grid
     M = prob_matrix(lam_h, lam_a, MAX_GOALS)
-    p_home, p_draw, p_away = result_probs(M)
-    p_over25 = over_prob(M, 2.5)
-    p_btts = btts_prob(M)
-    p_ng1h = p_no_goal_first_half(lam_h, lam_a, fh_share)
 
-    # 6) Build response (clean & emoji-friendly)
-    lines = []
-    lines.append(f"⚽️ **Match**: {home} vs {away}")
-    lines.append(f"📚 **Source**: {'History + Market' if have_history and market else 'History' if have_history else 'Market fit' if market else 'Priors'}")
-    if pH is not None:
-        lines.append(f"🏷️ Market 1X2 (fair probs): Home {pct(pH)} • Draw {pct(pD)} • Away {pct(pA)}")
-    if market and (line_sel is not None) and (target_over is not None):
-        lines.append(f"📈 Market Over/Under {line_sel}: Over {pct(target_over)} • Under {pct(1-target_over)}")
-
-    lines.append("🧠 **Model (Poisson)**")
-    lines.append(f"• Home win {pct(p_home)} • Draw {pct(p_draw)} • Away win {pct(p_away)}")
-    lines.append(f"• Over 2.5 {pct(p_over25)} • BTTS Yes {pct(p_btts)} • No goal 1H {pct(p_ng1h)}")
-
-    # 7) Parlays
-    if market and market["books"]:
-        best=None; cover=-1
-        for name,b in market["books"].items():
-            c= (1 if b.get("h2h") else 0) + (1 if b.get("totals") else 0) + (1 if b.get("btts") else 0)
-            if c>cover: best=(name,b); cover=c
-        tiers = select_parlays(best[0], best[1], M, line_pref=2.5) if best else []
-        if tiers:
-            lines.append("🎯 **Parlays (book vs. fair)**")
-            for t in tiers:
-                lines.append(
-                    f"• [{t['book']}] {t['legs_text']} — p={t['model_p']:.3f} "
-                    f"(fair {t['fair_odds']}) • market {t['market_odds']} • value× {t['value_ratio']}"
-                )
-        else:
-            lines.append("❕ No suitable bookmaker parlay found right now.")
+    # Build response header (coefficients only, no percentages)
+    header = []
+    header.append(f"⚽️ Match: {home} vs {away}")
+    if have_history and (pH is not None):
+        header.append("📚 Source: History + Market")
+    elif have_history:
+        header.append("📚 Source: History (no live odds)")
+    elif pH is not None:
+        header.append("📚 Source: Market fit (no history)")
     else:
-        if ODDS_API_KEY:
-            lines.append(f"ℹ️ No live odds available ({market_err}). Showing **model-only** parlays.")
-        else:
-            lines.append("ℹ️ No live odds key configured. Showing **model-only** parlays.")
+        header.append("📚 Source: Priors (no history/odds)")
 
-        # Build and de-duplicate model-only combos
+    # Build candidates with market if possible
+    tierA = tierB = tierC = None
+    items_for_range: List[Dict] = []
+
+    if best_book:
+        all_parlays = select_parlays(best_book[0], best_book[1], M, line_pref=2.5)
+        # choose key = market_odds for tiering; if missing, fallback to fair_odds
+        for c in all_parlays:
+            c["coef_for_tiering"] = c.get("market_odds") or c.get("fair_odds")
+        items_for_range = [c for c in all_parlays if c["coef_for_tiering"] > 1.0]
+        # pick by requested ranges
+        tierA = pick_tier_by_range(items_for_range, 1.45, 2.20, key="coef_for_tiering")
+        tierB = pick_tier_by_range(items_for_range, 3.0, 10.0, key="coef_for_tiering")
+        tierC = pick_tier_by_range(items_for_range, 20.0, 200.0, key="coef_for_tiering")
+
+    # If no odds/parlays available, build model-only combos & use fair odds for tiering
+    if not (tierA and tierB and tierC):
+        # Model-only legs
         base_legs = [
             ("result","home"), ("result","draw"), ("result","away"),
             ("ou","over",2.5), ("ou","under",2.5),
@@ -618,31 +619,57 @@ async def predict_once(league_key: str, home: str, away: str) -> str:
                     if lg[0]=="result": name.append(lg[1].upper())
                     elif lg[0]=="ou": name.append(("Over" if lg[1]=="over" else "Under")+f" {lg[2]}")
                     elif lg[0]=="btts": name.append("BTTS Yes" if lg[1] else "BTTS No")
-                candidates.append((" + ".join(name), p))
-        candidates = unique_by_legs(candidates)
-        # Pick tiers
-        two=[c for c in candidates if c[0].count('+')==1]
-        tier1 = max(two, key=lambda x: x[1]) if two else max(candidates, key=lambda x: x[1])
-        mids=[c for c in candidates if 0.25<=c[1]<=0.45]
-        tier2 = max(mids, key=lambda x: x[1]) if mids else sorted([c for c in candidates if c!=tier1], key=lambda x: -x[1])[0]
-        three=[c for c in candidates if c[0].count('+')==2 and 0.05<=c[1]<=0.20]
-        rest3=[c for c in candidates if c not in (tier1,tier2)]
-        tier3 = max(three, key=lambda x: x[1]) if three else (sorted([c for c in rest3 if c[0].count('+')==2], key=lambda x: -x[1])[0] if any(c[0].count('+')==2 for c in rest3) else sorted(rest3, key=lambda x: -x[1])[0])
+                fair = round(1.0/max(p,1e-9),2)
+                candidates.append({
+                    "book": "MODEL",
+                    "legs_text": " + ".join(name),
+                    "model_p": round(p,3),
+                    "fair_odds": fair,
+                    "market_odds": None,
+                    "value_ratio": 1.0,
+                    "coef_for_tiering": fair
+                })
+        # de-dup
+        unique = {}
+        for c in candidates:
+            key = tuple(sorted(c["legs_text"].split(" + ")))
+            if key not in unique:
+                unique[key] = c
+        items_for_range = list(unique.values())
+        tierA = tierA or pick_tier_by_range(items_for_range, 1.45, 2.20, key="coef_for_tiering")
+        tierB = tierB or pick_tier_by_range(items_for_range, 3.0, 10.0, key="coef_for_tiering")
+        tierC = tierC or pick_tier_by_range(items_for_range, 20.0, 200.0, key="coef_for_tiering")
 
-        lines.append("🧩 **Model-only Parlays (fair odds)**")
-        for name, p in [tier1, tier2, tier3]:
-            lines.append(f"• {name} — p={p:.3f} (fair {fair_odds(p)})")
+    # Format three tiers (always produce exactly three)
+    tiers = [("🎯 Safer (1.45–2.20)", tierA), ("🎯 Medium (3–10)", tierB), ("🎯 Long shot (20–200)", tierC)]
+    lines = []
+    lines.extend(header)
+
+    for label, t in tiers:
+        if not t:
+            lines.append(f"{label}: not available")
+            continue
+        coef = t.get("market_odds") or t.get("fair_odds")
+        src = "book" if t.get("market_odds") else "model"
+        legs = t["legs_text"] if "legs_text" in t else " + ".join([
+            ("HOME" if l[1]=="home" else "DRAW" if l[1]=="draw" else "AWAY") if l[0]=="result"
+            else (f"Over {l[1]}" if l[0]=="ou_over" else f"Under {l[1]}") if l[0].startswith("ou_")
+            else ("BTTS Yes" if (l[1]=="yes" or l[1] is True) else "BTTS No")
+            for l in t.get("legs", [])
+        ])
+        lines.append(f"{label}: {legs} — coef {coef:.2f} ({src})")
 
     return "\n".join(lines)
 
 # ========= Telegram handlers =========
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "Hi! I turn match data into probabilities and parlays.\n"
-        "Usage:\n"
+        "Hi! I turn match data into **coefficients** and pick 3 parlays:\n"
+        "1) 1.45–2.20  2) 3–10  3) 20–200\n\n"
+        "Use:\n"
         "/predict <league> ; <Home> ; <Away>\n"
         "Leagues: " + ", ".join(LEAGUES.keys()) + "\n"
-        "Example: /predict laliga ; Barcelona ; Sevilla"
+        "Example: /predict premier ; Chelsea ; Tottenham"
     )
     await update.message.reply_text(msg)
 
@@ -659,7 +686,7 @@ async def predict_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = await predict_once(league, home, away)
     except Exception as e:
         log.exception("Prediction error")
-        text = f"Error: {e}"
+        text = f"❌ Error: {e}"
     await update.message.reply_text(text)
 
 # ========= Startup hook: clear webhook, then poll =========
