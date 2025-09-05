@@ -11,7 +11,11 @@ from telegram import Update, InputFile
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # Images
-from PIL import Image, ImageDraw, ImageFont
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
 
 # ========= Runtime config (Railway: set in Variables) =========
 BOT_TOKEN      = os.environ.get("BOT_TOKEN") or ""
@@ -546,8 +550,17 @@ def legs_to_text(legs: Tuple) -> str:
     return " + ".join(out)
 
 # ========= Card image (Pillow) =========
-def render_card(match: str, source: str, tiers: List[Tuple[str,str,float,str]], insights: List[str]) -> bytes:
-    # tiers: [(label, legs, coef, src), ...]
+def render_card(match: str, source: str, tiers, insights):
+    """
+    Returns PNG bytes for a card image if Pillow is available; otherwise returns None.
+    tiers: list of (label, legs_text, coef_float, src_str)
+    insights: list[str]
+    """
+    if not PIL_AVAILABLE:
+        return None
+
+    # --- existing Pillow code below ---
+    import io
     W,H = 1000, 640
     img = Image.new("RGB", (W,H), (14,18,26))
     draw = ImageDraw.Draw(img)
