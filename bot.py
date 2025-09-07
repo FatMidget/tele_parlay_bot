@@ -604,62 +604,103 @@ def pick_by_range(cands: List[Dict], low: float, high: float) -> Optional[Dict]:
 
 # ========= Card image =========
 def render_card(match: str, source: str, tiers, insights):
+    """
+    Safe, auto-sizing card renderer.
+    - Computes needed height before creating the image
+    - Never draws boxes with negative height
+    - Falls back to None if Pillow isn't available
+    """
     if not PIL_AVAILABLE:
         return None
-    W, H = 1200, 700
+
+    import io
+    # --- Layout constants ---
+    W = 1200
+    MARGIN = 40
+    HEADER_H = 100
+    START_Y = 180
+    CARD_H = 140
+    GAP = 24
+    FOOTER_H = 170   # space for "Insights" + 3 bullets
+
+    # Compute dynamic height (header + 3 cards + footer + margins)
+    last_card_bottom = START_Y + (CARD_H * 3) + (GAP * 2)  # 3 cards, 2 gaps between them
+    footer_top = last_card_bottom + 10
+    H_needed = footer_top + FOOTER_H + MARGIN
+    H = max(740, H_needed)  # minimum 740, or whatever we need
+
+    # --- Create canvas & gradient ---
     img = Image.new("RGB", (W, H), (10, 14, 22))
     draw = ImageDraw.Draw(img)
 
-    # gradient
+    # Gradient background
     grad = Image.new("RGB", (W, H), 0)
     gdraw = ImageDraw.Draw(grad)
-    top = (18, 34, 64); bottom = (10, 14, 22)
+    top = (18, 34, 64)
+    bottom = (10, 14, 22)
     for y in range(H):
-        t = y / H
+        t = y / max(H - 1, 1)
         r = int(top[0]*(1-t) + bottom[0]*t)
         g = int(top[1]*(1-t) + bottom[1]*t)
         b = int(top[2]*(1-t) + bottom[2]*t)
-        gdraw.line([(0,y),(W,y)], fill=(r,g,b))
-    grad = grad.filter(ImageFilter.GaussianBlur(radius=18))
-    img.paste(grad, (0,0))
+        gdraw.line([(0, y), (W, y)], fill=(r, g, b))
+    try:
+        from PIL import ImageFilter
+        grad = grad.filter(ImageFilter.GaussianBlur(radius=18))
+    except Exception:
+        pass
+    img.paste(grad, (0, 0))
 
+    # Fonts
     try:
         font_title = ImageFont.truetype("DejaVuSans.ttf", 52)
         font_sub   = ImageFont.truetype("DejaVuSans.ttf", 30)
         font_body  = ImageFont.truetype("DejaVuSans.ttf", 28)
         font_small = ImageFont.truetype("DejaVuSans.ttf", 24)
-    except:
+    except Exception:
         font_title = ImageFont.load_default()
         font_sub   = ImageFont.load_default()
         font_body  = ImageFont.load_default()
         font_small = ImageFont.load_default()
 
-    # header
-    header_box = (40, 40, W-40, 140)
+    # Header bar
+    header_box = (MARGIN, MARGIN, W - MARGIN, MARGIN + HEADER_H)
     draw.rounded_rectangle(header_box, radius=24, fill=(20, 28, 44))
-    draw.text((60, 58), f"⚽ {match}", fill=(240, 245, 255), font=font_title)
-    draw.text((60, 110), f"Source: {source}", fill=(180, 195, 220), font=font_sub)
+    draw.text((MARGIN + 20, MARGIN + 18), f"⚽ {match}", fill=(240, 245, 255), font=font_title)
+    draw.text((MARGIN + 20, MARGIN + 70), f"Source: {source}", fill=(180, 195, 220), font=font_sub)
 
-    # tiers
-    start_y = 180; gap = 24; card_h = 140
+    # Tier cards
     stripe_colors = [(98, 184, 255), (255, 191, 94), (255, 108, 140)]
     for i, (label, legs, coef, src) in enumerate(tiers):
-        y = start_y + i*(card_h+gap)
-        box = (40, y, W-40, y+card_h)
+        y = START_Y + i * (CARD_H + GAP)
+        top_y = y
+        bot_y = y + CARD_H
+        # Guard: ensure bottom >= top
+        if bot_y <= top_y:
+            bot_y = top_y + 1
+        box = (MARGIN, top_y, W - MARGIN, bot_y)
         draw.rounded_rectangle(box, radius=22, fill=(26, 34, 52))
-        draw.rounded_rectangle((40, y, 48, y+card_h), radius=10, fill=stripe_colors[i%3])
-        draw.text((70, y+18), label, fill=(255,255,255), font=font_sub)
-        draw.text((70, y+70), legs,  fill=(210,220,235), font=font_body)
-        coef_txt = "N/A" if not coef or coef!=coef else f"{coef:.2f}"
-        draw.text((W-280, y+18), f"coef {coef_txt}", fill=(255, 223, 110), font=font_sub)
-        draw.text((W-280, y+70), f"{src}",           fill=(170,185,205),   font=font_body)
+        draw.rounded_rectangle((MARGIN, top_y, MARGIN + 8, bot_y), radius=10, fill=stripe_colors[i % 3])
 
-    # insights
-    foot_y = start_y + 3*(card_h+gap) + 10
-    draw.rounded_rectangle((40, foot_y, W-40, H-40), radius=22, fill=(20, 28, 44))
-    draw.text((60, foot_y+20), "💡 Insights", fill=(240,245,255), font=font_sub)
+        draw.text((MARGIN + 30, top_y + 18), label, fill=(255, 255, 255), font=font_sub)
+        draw.text((MARGIN + 30, top_y + 70), legs,  fill=(210, 220, 235), font=font_body)
+
+        coef_txt = "N/A" if (coef is None or (isinstance(coef, float) and coef != coef)) else f"{coef:.2f}"
+        draw.text((W - 280, top_y + 18), f"coef {coef_txt}", fill=(255, 223, 110), font=font_sub)
+        draw.text((W - 280, top_y + 70), f"{src}", fill=(170, 185, 205), font=font_body)
+
+    # Insights footer (auto fits inside H)
+    footer_top = last_card_bottom + 10
+    footer_bottom = min(footer_top + FOOTER_H, H - MARGIN)
+    # Guard: ensure bottom > top
+    if footer_bottom <= footer_top:
+        footer_bottom = footer_top + 120
+    draw.rounded_rectangle((MARGIN, footer_top, W - MARGIN, footer_bottom), radius=22, fill=(20, 28, 44))
+    draw.text((MARGIN + 20, footer_top + 20), "💡 Insights", fill=(240, 245, 255), font=font_sub)
+
+    y_line = footer_top + 70
     for j, line in enumerate(insights[:3]):
-        draw.text((60, foot_y+70 + j*36), f"• {line}", fill=(205,215,230), font=font_small)
+        draw.text((MARGIN + 20, y_line + j * 36), f"• {line}", fill=(205, 215, 230), font=font_small)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
